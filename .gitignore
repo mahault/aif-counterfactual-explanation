@@ -1,0 +1,28 @@
+# Emails and personal communications
+EMAIL_TO_JAMIE.md
+REVIEW_COMMENTS.md
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Environment
+.env
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Results
+rashomon_results/
+*.csv
+*.pt
