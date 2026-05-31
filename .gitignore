@@ -26,3 +26,7 @@ Thumbs.db
 rashomon_results/
 *.csv
 *.pt
+
+# Transient run logs
+*_sweep.log
+ablation_principled.log

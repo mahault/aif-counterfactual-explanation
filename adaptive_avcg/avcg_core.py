@@ -65,6 +65,21 @@ def get_dataset(name='credit'):
         X  = ds.data.features
         y  = ds.data.targets.iloc[:, 0]
         class_names = ['Not Spam', 'Spam']
+    elif name == 'pneumonia':
+        # PneumoniaMNIST: 28x28 grayscale chest X-rays, binary (normal/pneumonia).
+        # Flattened to a 784-dim vector so it flows through the same flat-vector
+        # MLP/CVAE pipeline as the tabular datasets. medmnist's curated splits are
+        # concatenated and re-split below for uniform treatment with the others.
+        from medmnist import PneumoniaMNIST
+        imgs, labels = [], []
+        for split in ('train', 'val', 'test'):
+            d = PneumoniaMNIST(split=split, download=True)
+            imgs.append(d.imgs.reshape(len(d.imgs), -1).astype('float32') / 255.0)
+            labels.append(d.labels.reshape(-1).astype('int64'))
+        X = pd.DataFrame(np.concatenate(imgs, axis=0),
+                         columns=[f'px{i}' for i in range(imgs[0].shape[1])])
+        y = pd.Series(np.concatenate(labels, axis=0))
+        class_names = ['Normal', 'Pneumonia']
     else:
         raise ValueError(f"Unknown dataset: {name}")
 

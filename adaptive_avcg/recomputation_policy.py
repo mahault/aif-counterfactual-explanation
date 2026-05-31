@@ -1,20 +1,39 @@
 """
-EFE-based REUSE/RETRAIN policy selection grounded in the Free Energy Principle.
+Principled REUSE/RETRAIN policy for adaptive counterfactual recomputation.
 
-Two-policy active inference: pi in {REUSE, RETRAIN}.
+Decision rule (decision-theoretic, no tuned cost weights):
 
-The decision rule IS active inference policy selection (Section 4 of paper scaffold):
-- Free energy F_t = AVCG objective G(x) evaluated under current Rashomon posterior P_R^t.
-  When the posterior drifts, F_t increases (cached CVAE is suboptimal for new posterior).
-- Valence = -dF/dt (Joffily & Coricelli, 2013). Negative valence = system is deteriorating.
-- Anxiety = anticipated future F increase under REUSE. When anxiety exceeds threshold,
-  the system triggers RETRAIN.
-- Expected Free Energy for each policy:
-    G(REUSE) = lambda_inv * ECI_t (estimated from D_t)
-    G(RETRAIN) = C_retrain (fixed computational cost)
-- Decision: RETRAIN when G(REUSE) > G(RETRAIN)
+    RETRAIN  iff  predicted_invalidity > (1 - p_target)
 
-Produces a full affective inference trace: F_t, valence, anxiety, G(REUSE), G(RETRAIN), decision.
+i.e. recompute exactly when the cached generator is predicted to exceed the
+invalidity we are willing to tolerate. `p_target` is a stated requirement, not a
+fitted hyperparameter — it is the *only* knob, and the threshold (1 - p_target) is
+its direct, interpretable consequence.
+
+`predicted_invalidity` is the worst case over up to three signals, all expressed in
+the same invalidity units in [0, 1], so the affective-term ablation is a fair
+comparison at a SHARED threshold (differences reflect signal quality, not a
+different appetite for compute):
+
+  inv_now      Myopic core. Invalidity already realised by the cached CFs under the
+               current model. Computable at deployment by running cached CFs through
+               the current model — no ground-truth labels required.
+  inv_kl       "Anxiety": drift-based anticipation. Calibrated linear map from the
+               predictive KL drift D_t to invalidity, fit online from observed
+               (D_t, invalidity) pairs. No minimum-slope floor: if drift carries no
+               signal (e.g. saturated/abrupt drift) the fit is flat and this term
+               simply never fires. Returns None until calibrated (>=3 points with
+               drift variation) so the policy never acts on an un-calibrated signal.
+  inv_forecast "Valence": trend-based anticipation. One-step extrapolation of the
+               realised invalidity using its rate of change — the discrete analogue
+               of -dF (Joffily & Coricelli, 2013).
+
+Ablation flags (config.use_valence / use_anxiety) toggle the two anticipatory
+signals on top of the always-on myopic core.
+
+This module also estimates the Theorem 5.1 quantities (sigma^2, beta) from the
+Rashomon predictive spread so the validity bound / threshold is data-grounded
+rather than set from placeholder constants.
 """
 
 import numpy as np
@@ -29,146 +48,93 @@ from adaptive_avcg.config import ExperimentConfig
 
 
 class RecomputationPolicy:
-    """Active inference recomputation decision rule."""
+    """Decision-theoretic recomputation rule with data-calibrated drift link."""
 
     def __init__(self, config: ExperimentConfig):
         self.config = config
-        self._F_history = []          # free energy trace
-        self._D_history = []          # drift (mean_kl) trace
-        self._validity_history = []   # actual validity trace
-        self._empirical_slope = None  # calibrated from (D_t, validity_drop) pairs
-        self._steps_since_retrain = 0  # steps since last retrain decision
-        self._total_steps = 0          # total decide() calls (for warm-up)
+        self._F_history = []
+        self._D_history = []
+        self._cal_slope = None       # calibrated D_t -> invalidity slope
+        self._cal_intercept = 0.0
+        self._F_cal_slope = None     # calibrated F (free energy) -> invalidity
+        self._F_cal_intercept = 0.0
+        self._steps_since_retrain = 0
+        self._total_steps = 0
 
     # ------------------------------------------------------------------
-    # Free Energy computation
+    # Free energy (used for the affective trace; not a tuned decision cost)
     # ------------------------------------------------------------------
 
     def compute_free_energy(self, cached_cvae, new_ensemble, val_loader,
                             lower, upper, epsilon: float,
                             n_eval: int = 30) -> float:
-        """Re-evaluate AVCG loss under new Rashomon posterior.
-
-        F_t = -E[expected_log_prob_rashomon(cf)] + lambda_prox * proximity
-        averaged over a batch of val samples.
-        """
+        """Re-evaluate the AVCG free energy of the cached generator under the new
+        Rashomon posterior: F_t = -E[expected_log_prob_rashomon] + prox term."""
         cached_cvae.eval()
         total_loss = 0.0
         count = 0
-
         for x, y in val_loader:
             if count >= n_eval:
                 break
             x, y = x.to(DEVICE), y.to(DEVICE)
-            target_cf = 1 - y
-
             with torch.no_grad():
-                y_t = target_cf
+                y_t = 1 - y
                 mu, logvar = cached_cvae.encode(x, y_t)
                 z = cached_cvae.reparameterize(mu, logvar)
                 x_prime = cached_cvae.decode(z, y_t)
-
-                # Rashomon expected log prob under NEW ensemble
-                exp_lp = new_ensemble.expected_log_prob_rashomon(
-                    x_prime, y_t, epsilon)
+                exp_lp = new_ensemble.expected_log_prob_rashomon(x_prime, y_t, epsilon)
                 proximity = F.mse_loss(x_prime, x, reduction='mean')
-
-                # AVCG loss (higher = worse)
-                loss = -exp_lp.item() + 0.1 * proximity.item()
-                total_loss += loss
+                total_loss += -exp_lp.item() + 0.1 * proximity.item()
                 count += len(y)
-
         return total_loss / max(count, 1)
 
     # ------------------------------------------------------------------
-    # Affective quantities
+    # Calibrated drift -> invalidity link (honest least-squares, no floor)
     # ------------------------------------------------------------------
 
-    def compute_valence(self, F_t: float, F_prev: float) -> float:
-        """Valence = -dF. Negative valence means system is deteriorating."""
-        return -(F_t - F_prev)
-
-    def compute_anxiety(self, D_t: float, validity_trend: list) -> float:
-        """Projected future invalidity if REUSE continues.
-
-        anxiety_t = E[F_{t+1} | pi=REUSE] - F_t
-        Approximated as: current drift rate * projected validity loss.
-        """
-        if len(validity_trend) < 2:
-            return D_t * self.config.invalidity_cost_weight
-
-        # Linear extrapolation of validity decline
-        recent = validity_trend[-3:]  # last 3 steps
-        if len(recent) >= 2:
-            slopes = [recent[i] - recent[i-1] for i in range(1, len(recent))]
-            avg_slope = np.mean(slopes)
-            # Anxiety = anticipated validity drop scaled by cost weight
-            projected_drop = max(0.0, -avg_slope)  # positive when validity declining
-            return (D_t + projected_drop) * self.config.invalidity_cost_weight
-        return D_t * self.config.invalidity_cost_weight
-
-    # ------------------------------------------------------------------
-    # Expected Free Energy for each policy
-    # ------------------------------------------------------------------
-
-    def compute_efe(self, policy: str, D_t: float, retrain_cost: float = None) -> float:
-        """G(pi) for each policy.
-
-        G(REUSE) = lambda_inv * ECI_t, where ECI estimated from D_t
-        G(RETRAIN) = C_retrain (fixed)
-        """
-        if retrain_cost is None:
-            retrain_cost = self.config.retrain_cost
-
-        if policy == 'REUSE':
-            # ECI estimated from drift via calibrated or linear relationship
-            eci_estimate = self._estimate_eci_from_drift(D_t)
-            return self.config.invalidity_cost_weight * eci_estimate
-        elif policy == 'RETRAIN':
-            return retrain_cost
-        else:
-            raise ValueError(f"Unknown policy: {policy}")
-
-    def _estimate_eci_from_drift(self, D_t: float) -> float:
-        """Map D_t to expected counterfactual invalidity.
-
-        If calibrated: use empirical slope from (D_t, validity_drop) pairs.
-        Otherwise: linear approximation ECI ~ D_t.
-        Scales with steps since last retrain to capture cumulative staleness.
-        """
-        # Base ECI from drift signal
-        if self._empirical_slope is not None:
-            base = self._empirical_slope * D_t
-        else:
-            base = D_t
-
-        # Scale by staleness: more steps since retrain = higher expected invalidity
-        staleness = 1.0 + 0.1 * self._steps_since_retrain
-        return base * staleness
-
-    # ------------------------------------------------------------------
-    # Calibration
-    # ------------------------------------------------------------------
-
-    def calibrate(self, drift_values: list, validity_drops: list):
-        """Calibrate ECI estimate from (D_t, validity_drop) pairs via linear regression.
-
-        validity_drop = 1 - actual_validity (higher = more invalid).
-        """
+    def calibrate(self, drift_values: list, invalidity_values: list):
+        """Fit invalidity ~= a + b * D_t from observed pairs. No minimum-slope
+        floor — a flat or negative fit (drift carries no invalidity signal) is left
+        as-is, so the drift term will not spuriously trigger recomputation."""
         if len(drift_values) < 3:
             return
+        D = np.asarray(drift_values, dtype=float)
+        V = np.asarray(invalidity_values, dtype=float)
+        if np.std(D) < 1e-10:
+            return  # no drift variation yet -> cannot fit; stay un-calibrated
+        b, a = np.polyfit(D, V, 1)   # V ~= a + b*D
+        self._cal_slope = float(b)
+        self._cal_intercept = float(a)
 
-        D = np.array(drift_values)
-        V = np.array(validity_drops)
+    def _predict_invalidity_from_drift(self, D_t: float):
+        """Calibrated drift-based invalidity estimate, or None if un-calibrated."""
+        if self._cal_slope is None:
+            return None
+        return float(np.clip(self._cal_intercept + self._cal_slope * D_t, 0.0, 1.0))
 
-        # Linear regression: V = slope * D + intercept
-        if np.std(D) > 1e-10:
-            slope = np.corrcoef(D, V)[0, 1] * np.std(V) / np.std(D)
-            # Enforce minimum slope: D_t always has a noise floor,
-            # so a near-zero slope means calibration hasn't seen enough stale data yet
-            self._empirical_slope = max(slope, 0.2)
-        else:
-            self._empirical_slope = 1.0
+    # ------------------------------------------------------------------
+    # Label-free free-energy -> invalidity calibration (F is computable
+    # without validity labels; diagnosed r~0.8-0.9, AUC~0.95 vs invalidity)
+    # ------------------------------------------------------------------
+
+    def calibrate_F(self, F_values: list, invalidity_values: list):
+        """Fit invalidity ~= a + b*F from a short labelled calibration window.
+        After this, decisions use only F (label-free)."""
+        if len(F_values) < 3:
+            return
+        F = np.asarray(F_values, dtype=float)
+        V = np.asarray(invalidity_values, dtype=float)
+        if np.std(F) < 1e-9:
+            return
+        b, a = np.polyfit(F, V, 1)
+        self._F_cal_slope = float(b)
+        self._F_cal_intercept = float(a)
+
+    def predict_invalidity_from_F(self, F_t: float):
+        """Label-free invalidity estimate from free energy, or None if un-calibrated."""
+        if self._F_cal_slope is None:
+            return None
+        return float(np.clip(self._F_cal_intercept + self._F_cal_slope * F_t, 0.0, 1.0))
 
     # ------------------------------------------------------------------
     # Decision
@@ -176,125 +142,148 @@ class RecomputationPolicy:
 
     def decide(self, D_t: float, F_t: float = None, F_prev: float = None,
                validity_trend: list = None) -> dict:
-        """Make REUSE/RETRAIN decision with full affective trace.
+        """RETRAIN iff predicted invalidity exceeds tolerance (1 - p_target)."""
+        tol = 1.0 - self.config.p_target
 
-        Returns dict with:
-            decision: 'REUSE' or 'RETRAIN'
-            G_reuse: EFE of REUSE
-            G_retrain: EFE of RETRAIN
-            valence: -dF (if F_t, F_prev provided)
-            anxiety: projected future cost
-            F_t: free energy (if provided)
-            D_t: drift value
-            threshold_empirical: G(REUSE) > G(RETRAIN)
-            threshold_theoretical: D_t > tau from Theorem 5.1
-        """
-        G_reuse = self.compute_efe('REUSE', D_t)
-        G_retrain = self.compute_efe('RETRAIN', D_t)
-
-        # Compute affect
-        valence = None
-        if F_t is not None and F_prev is not None:
-            valence = self.compute_valence(F_t, F_prev)
-
-        anxiety = 0.0
-        if validity_trend is not None:
-            anxiety = self.compute_anxiety(D_t, validity_trend)
-
-        # Incorporate anxiety into G(REUSE): anticipated future cost of continued reuse
-        G_reuse += anxiety
-
-        # Valence signal: if free energy is increasing (negative valence), system is
-        # deteriorating — add the magnitude as urgency signal to G(REUSE)
-        if valence is not None and valence < 0:
-            G_reuse += abs(valence) * self.config.invalidity_cost_weight
-
-        # Validity-based penalty: if last observed validity is below target,
-        # the current CVAE is already failing — strong signal to retrain
-        if validity_trend and len(validity_trend) >= 2:
-            last_val = validity_trend[-1]
-            if last_val < self.config.p_target:
-                G_reuse += (self.config.p_target - last_val) * self.config.invalidity_cost_weight
-
-        # Warm-up: force REUSE for first K steps to observe drift–validity relationship
-        in_warmup = self._total_steps < self.config.warmup_steps
-
-        # Decision: RETRAIN when anticipated invalidity exceeds retraining cost
-        if in_warmup:
-            decision = 'REUSE'  # observe only during warm-up
+        # Myopic core: invalidity already realised by the cached generator.
+        if validity_trend:
+            inv_now = 1.0 - validity_trend[-1]
+            inv_prev = (1.0 - validity_trend[-2]) if len(validity_trend) >= 2 else inv_now
         else:
-            decision = 'RETRAIN' if G_reuse > G_retrain else 'REUSE'
+            inv_now = inv_prev = 0.0
 
-        # Update counters
+        # Anxiety: drift-based anticipation (calibrated KL link).
+        inv_kl = self._predict_invalidity_from_drift(D_t)
+
+        # Valence: trend-based anticipation (one-step -dF extrapolation).
+        rate = inv_now - inv_prev                          # >0 => worsening
+        inv_forecast = float(np.clip(inv_now + max(0.0, rate), 0.0, 1.0))
+        valence = (-(F_t - F_prev)
+                   if (F_t is not None and F_prev is not None) else None)
+
+        # Assemble predicted invalidity under continued REUSE.
+        signals = [inv_now]
+        if self.config.use_anxiety and inv_kl is not None:
+            signals.append(inv_kl)
+        if self.config.use_valence:
+            signals.append(inv_forecast)
+        predicted_inv = max(signals)
+
+        decision = 'RETRAIN' if predicted_inv > tol else 'REUSE'
+
         self._total_steps += 1
         if decision == 'RETRAIN':
             self._steps_since_retrain = 0
         else:
             self._steps_since_retrain += 1
-
-        # Track history
         self._D_history.append(D_t)
         if F_t is not None:
             self._F_history.append(F_t)
 
         return {
             'decision': decision,
-            'G_reuse': G_reuse,
-            'G_retrain': G_retrain,
+            'predicted_invalidity': predicted_inv,
+            'tolerance': tol,
+            'inv_now': inv_now,
+            'inv_kl': inv_kl,
+            'inv_forecast': inv_forecast,
+            # Trace keys (kept for plotting/back-compat); semantics are invalidity
+            # units now: G_reuse = predicted invalidity, G_retrain = tolerance.
+            'G_reuse': predicted_inv,
+            'G_retrain': tol,
             'valence': valence,
-            'anxiety': anxiety,
+            'anxiety': (inv_kl if inv_kl is not None else 0.0),
             'F_t': F_t,
             'D_t': D_t,
-            'threshold_empirical': G_reuse > G_retrain,
-            'threshold_theoretical': D_t > self.config.theoretical_threshold,
+            'threshold_empirical': predicted_inv > tol,
+            'use_valence': self.config.use_valence,
+            'use_anxiety': self.config.use_anxiety,
         }
 
     # ------------------------------------------------------------------
-    # Expected Counterfactual Invalidity (ground truth)
+    # Ground-truth invalidity + data-grounded Theorem 5.1 quantities
     # ------------------------------------------------------------------
 
     @staticmethod
-    def compute_eci(cached_cvae, new_ensemble, test_loader, lower, upper,
+    def compute_eci(cached_cvae, new_ensemble, eval_loader, lower, upper,
                     epsilon: float, base_model, n_eval: int = 60) -> float:
-        """Expected counterfactual invalidity of cached CEs under new posterior.
-
-        Ground truth signal: generate CFs with cached CVAE, check validity
-        against NEW Rashomon set and base model.
-
-        Returns: fraction of CFs that are INVALID (1 - validity).
-        """
+        """Expected counterfactual invalidity of CACHED (stale) CEs under the new
+        posterior: fraction of cached CFs that are INVALID (1 - validity). Used as a
+        drift-degradation signal; not the Theorem 5.1 quantity (see below)."""
         cached_cvae.eval()
         valid_count = 0
         total = 0
-
-        for x, y in test_loader:
+        for x, y in eval_loader:
             if total >= n_eval:
                 break
             x, y = x.to(DEVICE), y.to(DEVICE)
-
             with torch.no_grad():
-                # Check prediction is correct
                 base_model.train()
                 outs = torch.stack([base_model(x) for _ in range(20)]).mean(0)
                 pred = outs.max(1)[1].item()
                 if pred != y.item():
                     continue
-
                 target_cf = 1 - pred
                 cf, _ = generate_cf_amortized(cached_cvae, x, target_cf, lower, upper)
                 if cf is None or not torch.all(torch.isfinite(cf)):
                     continue
-
-                # Validity under base model
                 v_base = validity(cf, target_cf, base_model)
-
-                # Rashomon validity under new ensemble
                 v_rash = rashomon_validity_ratio(cf, target_cf, new_ensemble, epsilon)
-
-                # Combined: valid if both base model AND majority of Rashomon set agree
                 valid_count += int(v_base == 1 and v_rash >= 0.5)
                 total += 1
-
         if total == 0:
             return 0.0
-        return 1.0 - valid_count / total  # invalidity = 1 - validity
+        return 1.0 - valid_count / total
+
+    @staticmethod
+    def estimate_theorem_bound(cvae, ensemble, eval_loader, lower, upper,
+                               epsilon: float, base_model, n_eval: int = 60,
+                               p_target: float = 0.90) -> dict:
+        """Data-grounded Theorem 5.1 / Corollary 3.5 quantities.
+
+        Estimated for CFs generated by `cvae` against the SAME `ensemble` they are
+        evaluated under — i.e. the well-specified (non-stale) case the theorem is
+        about. Pass a FRESH generator (e.g. the always-retrained CVAE); estimating
+        these from a stale generator under drifted posterior measures degradation,
+        not the bound, and gives a meaningless (often negative) margin.
+
+            sigma_sq : mean over CFs of Var_{theta in Rashomon}[ P_theta(y'|cf) ]
+            beta     : mean over CFs of the margin  E_R[P_theta(y'|cf)] - 0.5
+            tau      : first-order admissible drift. Cor 3.5 gives validity >~
+                       1 - sigma^2/beta^2; solving for p_target:
+                       tau = beta^2 * (1 - p_target) - sigma^2.
+                       tau <= 0 => bound is vacuous (cannot certify p_target even at
+                       zero drift) — reported honestly. beta <= 0 => CFs not even
+                       valid in-sample, theorem inapplicable.
+            n        : number of CFs evaluated
+        """
+        cvae.eval()
+        members = ensemble.get_rashomon_models(epsilon)
+        sigmas, betas = [], []
+        total = 0
+        for x, y in eval_loader:
+            if total >= n_eval:
+                break
+            x, y = x.to(DEVICE), y.to(DEVICE)
+            with torch.no_grad():
+                base_model.train()
+                outs = torch.stack([base_model(x) for _ in range(20)]).mean(0)
+                pred = outs.max(1)[1].item()
+                if pred != y.item():
+                    continue
+                target_cf = 1 - pred
+                cf, _ = generate_cf_amortized(cvae, x, target_cf, lower, upper)
+                if cf is None or not torch.all(torch.isfinite(cf)):
+                    continue
+                probs = np.asarray(
+                    [torch.exp(m(cf))[0, target_cf].item() for m in members],
+                    dtype=float)
+                sigmas.append(float(probs.var()))
+                betas.append(float(probs.mean() - 0.5))
+                total += 1
+        if total == 0:
+            return {'sigma_sq': 0.0, 'beta': 0.0, 'tau': 0.0, 'n': 0}
+        sigma_sq = float(np.mean(sigmas))
+        beta = float(np.mean(betas))
+        tau = beta ** 2 * (1.0 - p_target) - sigma_sq
+        return {'sigma_sq': sigma_sq, 'beta': beta, 'tau': float(tau), 'n': total}

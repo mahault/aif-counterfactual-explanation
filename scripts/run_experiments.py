@@ -29,7 +29,7 @@ def main():
         description='Adaptive AVCG drift detection experiments')
 
     parser.add_argument('--dataset', type=str, default=None,
-                        choices=['credit', 'adult_income', 'spambase'],
+                        choices=['credit', 'adult_income', 'spambase', 'pneumonia'],
                         help='Single dataset to run (default: all)')
     parser.add_argument('--drift', type=str, default=None,
                         choices=['covariate', 'label_noise', 'subpopulation', 'rotation'],

@@ -40,7 +40,32 @@ This work builds on:
 ```
 PAPER_SCAFFOLD.md     # Full paper outline with section-by-section plan
 LITERATURE_REVIEW.md  # Comprehensive lit review (45+ references)
+RESULTS.md            # Experiment results + ablation design
+adaptive_avcg/        # Implementation (core models, drift detector/simulator,
+                      #   recomputation policy, experiment runner, plotting)
+scripts/              # Experiment + ablation entry points and summaries
+results/              # Headline strategy results and publication figures
 ```
+
+## Setup & Running
+
+```bash
+pip install -r requirements.txt
+
+# Headline strategies (NEVER / ALWAYS / ADAPTIVE / FIXED_INTERVAL)
+python scripts/run_experiments.py --dataset credit --drift rotation --seed 11 --T 5  # smoke
+python scripts/run_experiments.py                                                    # full sweep
+
+# Valence/anxiety term ablation (ADAPT_BASE/VALENCE/ANXIETY/FULL)
+python scripts/run_ablation.py --dataset credit --drift rotation --seed 11 --T 5     # smoke
+python scripts/run_ablation.py                                                       # full sweep
+python scripts/test_ablation_logic.py                                                # fast, data-free check
+```
+
+**Datasets** (4, matching the AVCG suite): `credit`, `adult_income`, `spambase` (UCI,
+via `ucimlrepo`) and `pneumonia` (PneumoniaMNIST, via `medmnist`, flattened to a
+784-dim vector so it shares the flat-vector MLP/CVAE pipeline). **Drift types**:
+`covariate`, `label_noise`, `subpopulation`, `rotation`.
 
 ## Target Venues
 

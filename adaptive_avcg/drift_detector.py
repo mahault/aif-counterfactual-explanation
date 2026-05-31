@@ -1,11 +1,18 @@
 """
 Predictive KL divergence tracker between successive Rashomon-restricted posteriors.
 
-Key insight: Raw KL between discrete uniform posteriors over mask sets is degenerate.
-Instead we use **predictive KL divergence**:
+Key insight: Raw *parametric* KL between discrete uniform posteriors over mask sets
+is degenerate (the support is a finite set of masks, so the parameter-space KL is
+ill-defined or jumps to infinity under disjoint supports). Instead we measure drift
+in **probability (function) space** via the predictive KL divergence:
     D_t = E_{x~val}[ KL( P_R^{t+1}(y|x) || P_R^t(y|x) ) ]
 where P_R^t(y|x) = mean softmax over Rashomon members at time t.
 For binary classification this is KL between two Bernoullis — well-defined and bounded.
+
+Justification: by the data-processing inequality, the function-space (predictive) KL
+lower-bounds the parameter-space KL, so it is a conservative, well-behaved drift signal
+even when the parametric posteriors do not admit a tractable KL. See the function-space
+VI / KL-DPI discussion in https://iclr-blogposts.github.io/2024/blog/dpi-fsvi/.
 """
 
 import numpy as np
@@ -77,6 +84,14 @@ class DriftDetector:
                 logits = m(x_val)  # (n, 2) log-softmax
                 prob_sum += torch.exp(logits[:, 1])
         probs = (prob_sum / len(members)).cpu().numpy()
+        # Guard against a member emitting non-finite logits (can happen when a base
+        # model diverges under heavy label noise). Replace with 0.5 (no-information),
+        # which contributes ~0 KL rather than propagating NaN through the drift signal.
+        n_bad = int(np.sum(~np.isfinite(probs)))
+        if n_bad:
+            print(f"  [DriftDetector] WARNING: {n_bad} non-finite predictive probs "
+                  f"replaced with 0.5")
+            probs = np.nan_to_num(probs, nan=0.5, posinf=1.0, neginf=0.0)
         return probs
 
     def _compute_accuracy(self, ensemble) -> float:
@@ -127,6 +142,15 @@ class DriftDetector:
         new_acc = self._compute_accuracy(new_ensemble)
         new_nll = self._compute_nll(new_ensemble)
         new_size = new_ensemble.rashomon_size(self.epsilon)
+
+        # Defensive: ignore any residual non-finite entries so the drift signal
+        # is always a real number the policy can act on.
+        kl_per_sample = kl_per_sample[np.isfinite(kl_per_sample)]
+        jsd_per_sample = jsd_per_sample[np.isfinite(jsd_per_sample)]
+        if kl_per_sample.size == 0:
+            kl_per_sample = np.zeros(1)
+        if jsd_per_sample.size == 0:
+            jsd_per_sample = np.zeros(1)
 
         return {
             'mean_kl': float(np.mean(kl_per_sample)),

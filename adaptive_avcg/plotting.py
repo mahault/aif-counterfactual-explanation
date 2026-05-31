@@ -190,10 +190,23 @@ def plot_pareto_frontier(results: list, out_dir: str):
                      xerr=np.std(retrains), yerr=np.std(mean_vals),
                      color=style['color'], capsize=4, linewidth=1, zorder=4)
 
+    # Target validity from Theorem 5.1 — the validity floor the threshold tau is
+    # derived to maintain. Strategies above this line meet the guarantee.
+    p_target = None
+    for r in results:
+        p_target = r.get('config', {}).get('p_target')
+        if p_target is not None:
+            break
+    if p_target is not None:
+        ax.axhline(p_target, color='gray', linestyle='--', linewidth=1.2, zorder=1)
+        ax.text(0.98, p_target, f' target validity $p^*={p_target:.2f}$ (Thm 5.1)',
+                transform=ax.get_yaxis_transform(), ha='right', va='bottom',
+                fontsize=9, color='gray')
+
     ax.set_xlabel('Total Retrains', fontsize=12)
     ax.set_ylabel('Mean Validity', fontsize=12)
     ax.set_title('Compute-Validity Pareto Frontier', fontsize=14)
-    ax.legend(fontsize=10)
+    ax.legend(fontsize=10, loc='lower right')
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
     fig.savefig(os.path.join(out_dir, 'fig3_pareto_frontier.pdf'),
@@ -463,6 +476,166 @@ def plot_affective_trace(results: list, out_dir: str):
                 dpi=150, bbox_inches='tight')
     plt.close(fig)
     print("  Saved fig7_affective_trace")
+
+
+# ---------------------------------------------------------------------------
+# Figure 8: Valence/anxiety term ablation
+# ---------------------------------------------------------------------------
+
+ABLATION_STYLES = {
+    'ADAPT_BASE':    dict(color='#95a5a6', label='Base (no affect)'),
+    'ADAPT_VALENCE': dict(color='#3498db', label='+ Valence'),
+    'ADAPT_ANXIETY': dict(color='#e67e22', label='+ Anxiety'),
+    'ADAPT_FULL':    dict(color='#9b59b6', label='+ Valence & Anxiety (Full)'),
+}
+
+
+DRIFT_MARKERS = {'covariate': 'o', 'label_noise': 's',
+                 'rotation': '^', 'subpopulation': 'D'}
+
+
+def _ablation_stats(results, variant, drift):
+    """Return (mean_validity, std, mean_retrains, std_retrains) for a cell."""
+    vals, rcs = [], []
+    for r in results:
+        if r['drift_type'] != drift:
+            continue
+        s = r['strategies'].get(variant)
+        if s is None:
+            continue
+        vals.append(np.mean(s['metrics']['validity'][1:]))  # mean over t=1..T
+        rcs.append(s['retrain_count'])
+    if not vals:
+        return None
+    return (np.mean(vals), np.std(vals), np.mean(rcs), np.std(rcs))
+
+
+def plot_ablation_terms(results: list, out_dir: str):
+    """Valence/anxiety ablation, reported WITH compute so validity gains are not
+    confused with simply retraining more.
+
+    Left panel:  mean validity per variant per drift, each bar annotated with its
+                 mean retrain count (the compute it spent).
+    Right panel: validity vs. retrains (a Pareto view). A variant that only gains
+                 validity by moving right (more retrains) is not a better policy —
+                 it just spends more compute. Variants are connected base->full
+                 within each drift to make that trajectory visible.
+    """
+    drift_types = sorted(set(r['drift_type'] for r in results))
+    variants = [v for v in ABLATION_STYLES if any(
+        v in r.get('strategies', {}) for r in results)]
+    if not drift_types or not variants:
+        print("  No ablation results found, skipping fig8")
+        return
+
+    p_target = None
+    for r in results:
+        p_target = r.get('config', {}).get('p_target')
+        if p_target is not None:
+            break
+
+    fig, (axb, axp) = plt.subplots(1, 2, figsize=(15, 5.5),
+                                   gridspec_kw={'width_ratios': [1.2, 1]})
+
+    # ---- Left: mean-validity bars, annotated with retrain count ----
+    n_var = len(variants)
+    bar_w = 0.8 / n_var
+    x = np.arange(len(drift_types))
+    for j, variant in enumerate(variants):
+        means, errs, rets = [], [], []
+        for dt in drift_types:
+            st = _ablation_stats(results, variant, dt)
+            means.append(st[0] if st else 0.0)
+            errs.append(st[1] if st else 0.0)
+            rets.append(st[2] if st else 0.0)
+        offset = (j - (n_var - 1) / 2) * bar_w
+        style = ABLATION_STYLES[variant]
+        bars = axb.bar(x + offset, means, bar_w, yerr=errs, capsize=2,
+                       color=style['color'], edgecolor='black', linewidth=0.5,
+                       label=style['label'])
+        for b, rc in zip(bars, rets):
+            axb.text(b.get_x() + b.get_width() / 2, 0.02, f'{rc:.0f}',
+                     ha='center', va='bottom', fontsize=7, rotation=90,
+                     color='black')
+    if p_target is not None:
+        axb.axhline(p_target, color='gray', linestyle='--', linewidth=1.0)
+        axb.text(0.99, p_target, f' $p^*={p_target:.2f}$',
+                 transform=axb.get_yaxis_transform(), ha='right', va='bottom',
+                 fontsize=8, color='gray')
+    axb.set_xticks(x)
+    axb.set_xticklabels([d.replace('_', ' ').title() for d in drift_types],
+                        fontsize=10)
+    axb.set_ylabel('Mean Validity', fontsize=12)
+    axb.set_title('Mean validity (number = mean retrains)', fontsize=12)
+    axb.legend(fontsize=8, loc='lower right', ncol=2)
+    axb.grid(True, alpha=0.3, axis='y')
+    axb.set_ylim(0, 1.08)
+
+    # ---- Right: validity vs retrains (Pareto / compute view) ----
+    for dt in drift_types:
+        xs, ys = [], []
+        for variant in variants:
+            st = _ablation_stats(results, variant, dt)
+            if st is None:
+                continue
+            mv, _, rc, _ = st
+            xs.append(rc)
+            ys.append(mv)
+            axp.scatter(rc, mv, color=ABLATION_STYLES[variant]['color'],
+                        marker=DRIFT_MARKERS.get(dt, 'o'), s=80,
+                        edgecolors='black', linewidths=0.5, zorder=5)
+        if xs:
+            axp.plot(xs, ys, color='gray', linewidth=0.8, alpha=0.6, zorder=1)
+            axp.annotate(dt.replace('_', ' ').title(), (xs[-1], ys[-1]),
+                         fontsize=8, color='gray',
+                         xytext=(4, 0), textcoords='offset points', va='center')
+    if p_target is not None:
+        axp.axhline(p_target, color='gray', linestyle='--', linewidth=1.0)
+    # Variant color legend + drift marker legend
+    var_handles = [mpatches.Patch(color=ABLATION_STYLES[v]['color'],
+                                  label=ABLATION_STYLES[v]['label']) for v in variants]
+    axp.legend(handles=var_handles, fontsize=8, loc='lower right')
+    axp.set_xlabel('Mean Retrains (compute)', fontsize=12)
+    axp.set_ylabel('Mean Validity', fontsize=12)
+    axp.set_title('Validity vs. compute (line connects base$\\to$full per drift)',
+                  fontsize=12)
+    axp.grid(True, alpha=0.3)
+
+    fig.suptitle('Ablation: Valence & Anxiety Terms (validity reported with compute)',
+                 fontsize=14, y=1.02)
+    plt.tight_layout()
+    fig.savefig(os.path.join(out_dir, 'fig8_ablation_affective_terms.pdf'),
+                dpi=300, bbox_inches='tight')
+    fig.savefig(os.path.join(out_dir, 'fig8_ablation_affective_terms.png'),
+                dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print("  Saved fig8_ablation_affective_terms")
+
+
+def generate_ablation_figures(results_dir: str, out_dir: str = None):
+    """Generate the valence/anxiety ablation figure from an ablation results dir."""
+    if out_dir is None:
+        out_dir = os.path.join(results_dir, 'figures')
+    os.makedirs(out_dir, exist_ok=True)
+
+    combined = os.path.join(results_dir, 'all_ablation_results.json')
+    if os.path.exists(combined):
+        with open(combined) as f:
+            results = json.load(f)
+    else:
+        results = []
+        for fname in sorted(os.listdir(results_dir)):
+            if fname.endswith('_ablation.json'):
+                with open(os.path.join(results_dir, fname)) as f:
+                    results.append(json.load(f))
+
+    if not results:
+        print(f"No ablation results found in {results_dir}")
+        return
+
+    print(f"Loaded {len(results)} ablation results")
+    plot_ablation_terms(results, out_dir)
+    print(f"\nAblation figure saved to {out_dir}")
 
 
 # ---------------------------------------------------------------------------
